@@ -44,8 +44,12 @@ además notariza la app. Requiere guardar una vez las credenciales de notarizaci
 xcrun notarytool store-credentials macmonitor-notary --apple-id <email> --team-id <TEAM_ID>
 ```
 
-Para publicar una versión: subir `CFBundleShortVersionString` en `Info.plist`, `./build.sh --zip` y
-`gh release create vX.Y build/MacMonitor.zip`.
+Para publicar una versión (sube la versión en `Info.plist`, compila, notariza, commitea, taguea y crea
+el release en GitHub):
+
+```sh
+./release.sh 1.2 "Qué cambió en esta versión"
+```
 
 ## Depuración
 
