@@ -23,8 +23,8 @@ curl -fsSL https://raw.githubusercontent.com/arielvinas/mac-monitor/main/install
 ```
 
 Descarga el último [release](https://github.com/arielvinas/mac-monitor/releases/latest), lo copia a
-`/Applications` y lo abre. La app no está notarizada por Apple; si la bajás a mano desde el release
-y macOS no la deja abrir, corré `xattr -dr com.apple.quarantine /Applications/MacMonitor.app`.
+`/Applications` y lo abre. También se puede bajar el zip del release a mano: la app está firmada y
+notarizada por Apple, así que abre sin advertencias.
 
 ## Compilar
 
@@ -34,6 +34,14 @@ Requiere las Command Line Tools de Xcode (`xcode-select --install`).
 ./build.sh            # genera build/MacMonitor.app
 ./build.sh --install  # además lo copia a /Applications y lo abre
 ./build.sh --zip      # además genera build/MacMonitor.zip para subir a un release
+```
+
+Si hay un certificado "Developer ID Application" en el llavero, `build.sh` firma con él y `--zip`
+además notariza la app. Requiere guardar una vez las credenciales de notarización
+(con una [contraseña de app](https://account.apple.com) de la cuenta de desarrollador):
+
+```sh
+xcrun notarytool store-credentials macmonitor-notary --apple-id <email> --team-id <TEAM_ID>
 ```
 
 Para publicar una versión: subir `CFBundleShortVersionString` en `Info.plist`, `./build.sh --zip` y

@@ -14,7 +14,5 @@ ditto -x -k "$TMP/MacMonitor.zip" "$TMP"
 pkill -x MacMonitor 2>/dev/null || true
 rm -rf /Applications/MacMonitor.app
 mv "$TMP/MacMonitor.app" /Applications/
-# La app no está notarizada: se quita la cuarentena para que Gatekeeper no la bloquee.
-xattr -dr com.apple.quarantine /Applications/MacMonitor.app 2>/dev/null || true
 open /Applications/MacMonitor.app
 echo "MacMonitor instalado en /Applications y en ejecución."
