@@ -65,11 +65,12 @@ struct ValueText: View {
 struct ProcessList: View {
     let entries: [ProcessEntry]
     let format: (Double) -> (String, String)
+    var placeholder = "Cargando…"
     var body: some View {
         Card {
             SectionTitle(text: "PROCESOS")
             if entries.isEmpty {
-                Text("Cargando…").font(.system(size: 12)).foregroundStyle(.secondary)
+                Text(placeholder).font(.system(size: 12)).foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, minHeight: 100)
             }
             ForEach(entries) { entry in
@@ -292,6 +293,84 @@ struct MemoryView: View {
     private func row(_ color: Color, _ label: String, _ bytes: UInt64) -> some View {
         let (v, u) = Fmt.bytes(Double(bytes))
         return LegendRow(color: color, label: label, value: v, unit: u)
+    }
+}
+
+// MARK: - Red
+
+struct NetworkHistoryChart: View {
+    let history: [NetworkRate]
+    let capacity: Int
+    /// Escala compartida por ambas mitades: entrada hacia arriba, salida hacia abajo (como iStat).
+    let scale: Double
+    var body: some View {
+        Canvas { ctx, size in
+            let slot = size.width / CGFloat(capacity)
+            let barW = max(1, slot * 0.72)
+            let mid = size.height / 2
+            let offset = capacity - history.count
+            ctx.fill(Path(CGRect(x: 0, y: mid - 0.5, width: size.width, height: 1)), with: .color(Palette.track))
+            for (i, rate) in history.enumerated() {
+                let x = CGFloat(i + offset) * slot + (slot - barW) / 2
+                let inH = CGFloat(min(1, rate.inBps / scale)) * (mid - 1)
+                let outH = CGFloat(min(1, rate.outBps / scale)) * (mid - 1)
+                if inH > 0 { ctx.fill(Path(CGRect(x: x, y: mid - 0.5 - inH, width: barW, height: inH)), with: .color(Palette.blue)) }
+                if outH > 0 { ctx.fill(Path(CGRect(x: x, y: mid + 0.5, width: barW, height: outH)), with: .color(Palette.pink)) }
+            }
+        }
+    }
+}
+
+struct NetworkView: View {
+    @ObservedObject var monitor: Monitor
+
+    var body: some View {
+        let rate = monitor.network
+        let scale = niceScale(monitor.networkHistory.map { max($0.inBps, $0.outBps) }.max() ?? 0)
+        VStack(spacing: 8) {
+            Card {
+                HStack {
+                    SectionTitle(text: "RED")
+                    Spacer()
+                    let (v, u) = Fmt.rate(scale)
+                    Text("escala \(v) \(u)").font(.system(size: 12)).foregroundStyle(.secondary)
+                }
+                NetworkHistoryChart(history: monitor.networkHistory, capacity: Monitor.historyCapacity, scale: scale)
+                    .frame(height: 110)
+                HStack(spacing: 14) {
+                    rateRow(Palette.blue, "Entrada", rate.inBps)
+                    rateRow(Palette.pink, "Salida", rate.outBps)
+                }
+            }
+            Card {
+                SectionTitle(text: "TOTAL DESDE QUE SE ABRIÓ")
+                totalRow(Palette.blue, "Recibido", monitor.net.totalIn)
+                totalRow(Palette.pink, "Enviado", monitor.net.totalOut)
+            }
+            ProcessList(entries: monitor.networkProcesses ?? [], format: Fmt.rate,
+                        placeholder: monitor.networkProcesses == nil ? "Cargando…" : "Sin tráfico")
+            Footer()
+        }
+        .padding(10)
+        .frame(width: 330)
+    }
+
+    private func rateRow(_ color: Color, _ label: String, _ bps: Double) -> some View {
+        let (v, u) = Fmt.rate(bps)
+        return LegendRow(color: color, label: label, value: v, unit: u)
+    }
+
+    private func totalRow(_ color: Color, _ label: String, _ bytes: UInt64) -> some View {
+        let (v, u) = Fmt.total(bytes)
+        return LegendRow(color: color, label: label, value: v, unit: u)
+    }
+
+    /// Redondea el máximo hacia arriba a 1, 2 o 5 KB/MB/GB/s para que la escala sea legible.
+    private func niceScale(_ peak: Double) -> Double {
+        let steps = [1024.0, 1_048_576, 1_073_741_824].flatMap { unit in
+            [1.0, 2, 5, 10, 20, 50, 100, 200, 500].map { $0 * unit }
+        }
+        return steps.first { $0 >= peak && $0 >= 10 * 1024 } ?? steps.last!
     }
 }
 

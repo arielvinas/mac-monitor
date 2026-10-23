@@ -135,6 +135,46 @@ struct MemoryInfo {
     }
 }
 
+// MARK: - Red
+
+struct NetworkRate {
+    var inBps: Double = 0
+    var outBps: Double = 0
+}
+
+final class NetworkReader {
+    private var prev: (bytesIn: UInt32, bytesOut: UInt32, time: TimeInterval)?
+    private(set) var totalIn: UInt64 = 0    // acumulado desde que abrió la app
+    private(set) var totalOut: UInt64 = 0
+
+    /// Velocidad por las interfaces físicas (en*: Wi-Fi, Ethernet, Thunderbolt).
+    /// Se ignoran lo0 y las virtuales (utun, awdl, bridge…) para no contar doble el tráfico de VPN o VMs.
+    func sample() -> NetworkRate {
+        var bytesIn: UInt32 = 0, bytesOut: UInt32 = 0
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return NetworkRate() }
+        defer { freeifaddrs(ifaddr) }
+        for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let ifa = ptr.pointee
+            guard let addr = ifa.ifa_addr, addr.pointee.sa_family == UInt8(AF_LINK),
+                  ifa.ifa_flags & UInt32(IFF_UP) != 0,
+                  String(cString: ifa.ifa_name).hasPrefix("en"),
+                  let data = ifa.ifa_data?.assumingMemoryBound(to: if_data.self) else { continue }
+            // Los contadores de if_data son de 32 bits: con &+ / &- el desborde se cancela en el delta.
+            bytesIn = bytesIn &+ data.pointee.ifi_ibytes
+            bytesOut = bytesOut &+ data.pointee.ifi_obytes
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        defer { prev = (bytesIn, bytesOut, now) }
+        guard let prev, now > prev.time else { return NetworkRate() }
+        let dIn = bytesIn &- prev.bytesIn, dOut = bytesOut &- prev.bytesOut
+        totalIn += UInt64(dIn)
+        totalOut += UInt64(dOut)
+        let elapsed = now - prev.time
+        return NetworkRate(inBps: Double(dIn) / elapsed, outBps: Double(dOut) / elapsed)
+    }
+}
+
 // MARK: - Procesos
 
 struct ProcessEntry: Identifiable {
@@ -174,7 +214,7 @@ enum ProcessReader {
         return aggregate(rows, limit: limit)
     }
 
-    private static func aggregate(_ rows: [(pid_t, Double)], limit: Int) -> [ProcessEntry] {
+    static func aggregate(_ rows: [(pid_t, Double)], limit: Int) -> [ProcessEntry] {
         var totals: [String: (name: String, path: String, value: Double)] = [:]
         for (pid, value) in rows where value > 0 {
             let (key, name, path) = identify(pid)
@@ -248,6 +288,74 @@ enum ProcessReader {
     }
 }
 
+// MARK: - Tráfico por proceso
+
+/// Corre `nettop` en modo delta (un bloque por segundo) mientras el popover de red está abierto.
+/// Una lectura única tarda ~5 s en nettop, por eso se deja corriendo en vez de invocarlo en cada tick.
+/// Va dentro de `script` para que tenga una terminal: escribiendo a un pipe, nettop acumula la salida en bloques de 4 KB.
+final class NetworkProcessStream {
+    private var task: Process?
+    private var stdin: Pipe?
+    private var buffer = ""
+    private var block: [(pid_t, Double)] = []
+    private var blocks = 0
+    private let onUpdate: ([ProcessEntry]) -> Void
+
+    init(onUpdate: @escaping ([ProcessEntry]) -> Void) { self.onUpdate = onUpdate }
+
+    func start() {
+        guard task == nil else { return }
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/script")
+        task.arguments = ["-q", "/dev/null", "/usr/bin/nettop",
+                          "-P", "-L", "0", "-d", "-s", "1", "-x", "-t", "external", "-J", "bytes_in,bytes_out"]
+        task.environment = ["LC_ALL": "C"]
+        let pipe = Pipe()
+        // stdin abierto y sin datos: si `script` recibe EOF corta la sesión.
+        let stdin = Pipe()
+        task.standardInput = stdin
+        task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
+        buffer = ""; block = []; blocks = 0
+        // El handler corre en una cola propia y serie, así que el estado de parseo no necesita lock.
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { handle.readabilityHandler = nil; return }
+            self?.consume(String(decoding: data, as: UTF8.self))
+        }
+        do { try task.run(); self.task = task; self.stdin = stdin } catch { pipe.fileHandleForReading.readabilityHandler = nil }
+    }
+
+    func stop() {
+        task?.terminate()
+        task = nil
+        stdin = nil
+    }
+
+    private func consume(_ chunk: String) {
+        // La terminal termina las líneas en "\r\n", que para Swift es un solo Character: se quita el "\r".
+        buffer += chunk.replacingOccurrences(of: "\r", with: "")
+        while let nl = buffer.firstIndex(of: "\n") {
+            let line = buffer[..<nl]
+            buffer.removeSubrange(...nl)
+            if line.hasPrefix(",") { flush(); continue }   // encabezado = empieza un bloque nuevo
+            // Filas "nombre.pid,entrada,salida,"; el nombre puede tener puntos, el pid va tras el último.
+            let parts = line.split(separator: ",", omittingEmptySubsequences: false)
+            guard parts.count >= 3, let dot = parts[0].lastIndex(of: "."),
+                  let pid = pid_t(parts[0][parts[0].index(after: dot)...]),
+                  let bIn = Double(parts[1]), let bOut = Double(parts[2]) else { continue }
+            block.append((pid, bIn + bOut))
+        }
+    }
+
+    private func flush() {
+        defer { block = []; blocks += 1 }
+        // El primer bloque trae los acumulados históricos, no la velocidad: se descarta.
+        guard blocks >= 1 else { return }
+        onUpdate(ProcessReader.aggregate(block, limit: 5))
+    }
+}
+
 // MARK: - Formato
 
 enum Fmt {
@@ -257,5 +365,20 @@ enum Fmt {
         let gb = b / 1_073_741_824
         if gb >= 1 { return (String(format: "%.1f", gb), "GB") }
         return (String(format: "%.0f", b / 1_048_576), "MB")
+    }
+
+    /// Bytes/s con 3 cifras como máximo ("812 KB/s", "1.4 MB/s").
+    static func rate(_ bps: Double) -> (String, String) {
+        let units = ["B/s", "KB/s", "MB/s", "GB/s"]
+        var v = max(0, bps), i = 0
+        while v >= 999.5 && i < units.count - 1 { v /= 1024; i += 1 }
+        return (String(format: i > 0 && v < 9.95 ? "%.1f" : "%.0f", v), units[i])
+    }
+
+    static func total(_ b: UInt64) -> (String, String) {
+        let v = Double(b)
+        if v >= 1_073_741_824 { return (String(format: "%.2f", v / 1_073_741_824), "GB") }
+        if v >= 1_048_576 { return (String(format: "%.1f", v / 1_048_576), "MB") }
+        return (String(format: "%.0f", v / 1024), "KB")
     }
 }
